@@ -10,7 +10,16 @@ import json
 import re
 import xml.etree.ElementTree as ET
 
-# Extract Data
+try:
+    from google.cloud import bigquery
+    from google.cloud.exceptions import NotFound as BigQueryNotFound
+except ImportError:
+    print(
+        "Warning: google-cloud-bigquery is not installed. The 'load' step will not work."
+    )
+
+from prefect import task, flow
+from prefect.futures import PrefectFuture
 
 
 def extracts(file_path: str) -> list:
@@ -71,35 +80,6 @@ def extracts(file_path: str) -> list:
             return customer_billing_data
         except Exception as e:
             print(f"Error reading XML file: {e}")
-
-    # Load the txt file
-    elif file_format == "txt":
-        try:
-            with open(file_path, "r") as txt_file:
-                content = txt_file.read()
-
-                # Split the content by employee_id to separate the individual flaggged prompts
-                flagged_prompts = content.split("Employee ID:")[
-                    1:
-                ]  # Skip the first empty string
-
-                flagged_prompts_obj = []
-
-                for flagged_prompt in flagged_prompts:
-                    # split each flagged_prompt
-                    items = str(flagged_prompt).strip().split("\n")
-
-                    # create the dictionary object
-                    prompt_dict = {
-                        "employee_id": items[0].strip(),
-                        "timestamp": items[1].split("Timestamp: ")[1].strip(),
-                        "prompt": items[2].split("Prompt: ")[1].strip(),
-                    }
-                    flagged_prompts_obj.append(prompt_dict)
-            return flagged_prompts_obj
-
-        except FileNotFoundError:
-            print(f"Error reading TXT file: {e}")
     else:
         print("Format not supported")
 
@@ -148,6 +128,21 @@ class DataTransformer:
                 new_row[new_key] = value
             standardized_data.append(new_row)
         return standardized_data
+
+    def standardize_phone_key(self, data: list) -> list:
+        """
+        Standardizes the phone number key from 'phone_no' to 'phone_number'.
+
+        Args:
+            data (list): A list of dictionaries.
+
+        Returns:
+            list: The list of dictionaries with the phone key standardized.
+        """
+        for row in data:
+            if "phone_no" in row:
+                row["phone_number"] = row.pop("phone_no")
+        return data
 
     def format_phone_number(self, phone_number: str) -> str | None:
         """
@@ -233,6 +228,22 @@ class DataTransformer:
 
         return masked_data
 
+    def add_customer_id(self, data: list) -> list:
+        """
+        Adds a sequential customer_id to each record, starting from 1.
+
+        Args:
+            data (list): A list of dictionaries representing customer records.
+
+        Returns:
+            list: The list of dictionaries with 'customer_id' added to each.
+        """
+        data_with_id = []
+        for i, row in enumerate(data, start=1):
+            row["customer_id"] = str(i)
+            data_with_id.append(row)
+        return data_with_id
+
     def join(self, csv_data: list, json_data: list, xml_data: list) -> list:
         """
         Joins data from different sources based on common keys, prioritizing CSV data and merging others.
@@ -276,10 +287,13 @@ class DataTransformer:
             (
                 row["first_name"],
                 row["last_name"],
-                row["phone_no"],
+                row["phone_number"],
             ): row
             for row in xml_data
-            if row and "phone_no" in row and "first_name" in row and "last_name" in row
+            if row
+            and "phone_number" in row
+            and "first_name" in row
+            and "last_name" in row
         }
 
         joined_data: list[dict] = []
@@ -303,48 +317,118 @@ class DataTransformer:
         return joined_data
 
 
-def extract_data(file_paths: str):
+# Step 3 - Load
+
+
+def load_to_bigquery(
+    data: list[dict],
+    project_id: str,
+    dataset_id: str,
+    table_id: str,  # This argument is now passed from the flow
+    schema: list[bigquery.SchemaField],
+):
     """
-    Extracts data from a file and returns a dictionary with the data.
+    Loads data into a specified BigQuery table.
 
-    Input: file_paths - path to the file
-    Output: list object with the data
+    Creates the dataset and table if they don't exist.
+
+    Args:
+        data (list[dict]): The data to load (list of dictionaries).
+        project_id (str): Your Google Cloud project ID.
+        dataset_id (str): The BigQuery dataset ID.
+        table_id (str): The BigQuery table ID.
+        schema (list[bigquery.SchemaField]): The schema of the BigQuery table.
     """
-    csv_data = None
-    json_data = None
-    xml_data = None
-    txt_data = None
+    if not data:
+        print(f"No data provided to load into {table_id}. Skipping.")
+        return
 
-    # Extract data from each file based on its type
-    for file_path in file_paths:
-        file_format = file_path.split(".")[-1].lower()
-        if file_format == "csv":
-            csv_data = extracts(file_path)
-        elif file_format == "json":
-            json_data = extracts(file_path)
-        elif file_format == "xml":
-            xml_data = extracts(file_path)
-        elif file_format == "txt":
-            txt_data = extracts(file_path)
-        else:
-            print(f"Unsupported file format for: {file_path}")
+    try:
+        client = bigquery.Client(project=project_id)
+    except NameError:
+        print(
+            "BigQuery client could not be initialized. Is 'google-cloud-bigquery' installed?"
+        )
+        return
 
-    return csv_data, json_data, xml_data, txt_data
+    dataset_ref = client.dataset(dataset_id)
+    try:
+        client.get_dataset(dataset_ref)
+        print(f"Dataset {dataset_id} already exists.")
+    except BigQueryNotFound:
+        print(f"Dataset {dataset_id} not found, creating it.")
+        client.create_dataset(dataset_ref, exists_ok=True)
+
+    table_ref = dataset_ref.table(table_id)
+    try:
+        client.get_table(table_ref)
+        print(f"Table {table_id} already exists.")
+    except BigQueryNotFound:
+        print(f"Table {table_id} not found, creating it.")
+        table = bigquery.Table(table_ref, schema=schema)
+        client.create_table(table, exists_ok=True)
+
+    print(f"Loading data into {dataset_id}.{table_id}...")
+    job_config = bigquery.LoadJobConfig(
+        schema=schema,
+        write_disposition="WRITE_APPEND",  # Or "WRITE_TRUNCATE" to overwrite
+    )
+
+    try:
+        load_job = client.load_table_from_json(data, table_ref, job_config=job_config)
+        load_job.result()  # Wait for the job to complete
+        print(
+            f"Successfully loaded {load_job.output_rows} rows into {dataset_id}.{table_id}."
+        )
+    except Exception as e:
+        print(f"Failed to load data into BigQuery: {e}")
+        if hasattr(e, "errors"):
+            print("BigQuery errors:", e.errors)
 
 
-# Step 3 - Load (Todo)
+@task(name="Define BigQuery Schema")
+def get_customer_schema() -> list:
+    """Returns the schema for the customer BigQuery table."""
+    return [
+        bigquery.SchemaField("customer_id", "STRING"),
+        bigquery.SchemaField("customer_type", "STRING"),
+        bigquery.SchemaField("first_name", "STRING"),
+        bigquery.SchemaField("last_name", "STRING"),
+        bigquery.SchemaField("company_name", "STRING"),
+        bigquery.SchemaField("email", "STRING"),
+        bigquery.SchemaField("phone_number", "STRING"),
+        bigquery.SchemaField("dob", "DATE"),
+        bigquery.SchemaField("sex", "STRING"),
+        bigquery.SchemaField("subscription_type", "STRING"),
+        bigquery.SchemaField("payment_method", "STRING"),
+        bigquery.SchemaField("billing_address__street", "STRING"),
+        bigquery.SchemaField("billing_address__city", "STRING"),
+        bigquery.SchemaField("billing_address__postcode", "STRING"),
+        bigquery.SchemaField("card_details__card_number", "STRING"),
+        bigquery.SchemaField("card_details__expiry_date", "STRING"),
+        bigquery.SchemaField("card_details_cvv", "STRING"),
+    ]
 
 
-def main(file_paths: list):
+@task(name="Extract Data Task")
+def extract_task(file_path: str) -> list:
+    """Prefect task to extract data from a single file."""
+    print(f"Extracting data from: {file_path}")
+    return extracts(file_path)
+
+
+@task(name="Transform Data Task")
+def transform_task(csv_data: list, json_data: list, xml_data: list) -> list:
     """
-    Main function to extract, and transform.
-
-    Input: file_paths - list of file paths
-    Output: transformed data
+    Prefect task to transform and merge data from all sources.
     """
-    csv_data, json_data, xml_data, txt_data = extract_data(file_paths)
-
-    # Instantiate the data transformer
+    print("Starting data transformation...")
+    if not csv_data:
+        csv_data = []
+    if not json_data:
+        json_data = []
+    if not xml_data:
+        xml_data = []
     transformer = DataTransformer()
 
     # Apply transformations to CSV data
@@ -374,7 +458,8 @@ def main(file_paths: list):
                 row["PhoneNo"] = transformer.format_phone_number(row["PhoneNo"])
 
         flattened_xml = transformer.flatten_nested_dictionaries(xml_data)
-        standardized_xml = transformer.standardize_keys(flattened_xml)
+        keys_standardized_xml = transformer.standardize_keys(flattened_xml)
+        standardized_xml = transformer.standardize_phone_key(keys_standardized_xml)
 
     # Apply transformations to JSON data
     standardized_json = None
@@ -382,38 +467,75 @@ def main(file_paths: list):
         flattened_json = transformer.flatten_nested_dictionaries(json_data)
         standardized_json = transformer.standardize_keys(flattened_json)
 
-    # Apply transformations to TXT data
-    standardized_txt = None
-    if txt_data:
-        flattened_txt = transformer.flatten_nested_dictionaries(txt_data)
-        standardized_txt = transformer.standardize_keys(flattened_txt)
-
     # Join the data using the DataTransformer class
     joined_data = transformer.join(
         standardized_csv, standardized_json, standardized_xml
     )
 
-    # Masked the card details and the cvv
-    transformed_data = transformer.mask_card_details_cvv(joined_data)
+    # Add a sequential customer_id to the joined data
+    data_with_id = transformer.add_customer_id(joined_data)
 
-    # For now, let's just return the transformed data for demonstration
-    return (
-        standardized_csv,
-        standardized_json,
-        standardized_xml,
-        standardized_txt,
-        transformed_data,
+    # Masked the card details and the cvv
+    transformed_data = transformer.mask_card_details_cvv(data_with_id)
+
+    print("Transformation complete.")
+    return transformed_data
+
+
+@task(name="Load Data to BigQuery Task")
+def load_task(
+    data: list, project_id: str, dataset_id: str, table_id: str, schema: list
+):
+    """Prefect task to load data into BigQuery."""
+    load_to_bigquery(
+        data=data,
+        project_id=project_id,
+        dataset_id=dataset_id,
+        table_id=table_id,
+        schema=schema,
+    )
+
+
+@flow(name="ETL Pipeline Flow")
+def etl_pipeline_flow(file_paths: list, project_id: str, dataset_id: str):
+    """The main Prefect flow to orchestrate the ETL process."""
+
+    # --- Extract ---
+    # Use a dictionary to hold futures for extracted data
+    extracted_data = {"csv": None, "json": None, "xml": None}
+    for path in file_paths:
+        file_format = path.split(".")[-1].lower()
+        if file_format in extracted_data:
+            # Submit task to run and store its future
+            extracted_data[file_format] = extract_task.submit(path)
+
+    # --- Transform ---
+    transformed_data_future = transform_task.submit(
+        csv_data=extracted_data["csv"],
+        json_data=extracted_data["json"],
+        xml_data=extracted_data["xml"],
+    )
+
+    # --- Load ---
+    schema_future = get_customer_schema.submit()
+    load_task.submit(
+        data=transformed_data_future,
+        project_id=project_id,
+        dataset_id=dataset_id,
+        table_id="customers_transformed",
+        schema=schema_future,
     )
 
 
 file_paths = [
-    "/content/drive/MyDrive/customers_billing.xml",
-    "/content/drive/MyDrive/customers.csv",
-    "/content/drive/MyDrive/customers_subscriptions.json",
+    "/data/customers_billing.xml",
+    "/data/customers.csv",
+    "/data/customers_subscriptions.json",
 ]
 
-csv_data, json_data, xml_data, txt_data = extract_data(file_paths)
 
-standardized_csv, standardized_json, standardized_xml, standardized_txt, joined_data = (
-    main(file_paths)
-)
+if __name__ == "__main__":
+    PROJECT_ID = "etl-project-475811"  # <-- Project ID
+    DATASET_ID = "customer_data_prefect"  # Using a new dataset for clarity
+
+    etl_pipeline_flow(file_paths, PROJECT_ID, DATASET_ID)

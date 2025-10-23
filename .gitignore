@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Service account key
+etl-project-475811-3762fcb5cd5b.json
