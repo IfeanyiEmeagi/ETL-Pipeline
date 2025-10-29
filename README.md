@@ -26,7 +26,7 @@ This ETL pipeline was built to solve that exact problem by automating the proces
 
 ## Technology Stack
 
-*   **Language**: Python 3
+*   **Language**: Python 3.13
 *   **Orchestration**: Prefect 2.0
 *   **Data Warehouse**: Google BigQuery
 *   **Core Libraries**: No third-party data manipulation libraries like Pandas were used, demonstrating foundational data processing skills.
@@ -53,7 +53,7 @@ The pipeline is orchestrated as a Prefect flow with three main stages:
 Follow these steps to get the project running on your local machine.
 
 ### Prerequisites
-*   Python 3.12+
+*   Python 3.13+
 *   A Google Cloud Platform (GCP) project.
 *   `gcloud` CLI installed and authenticated.
 *   A GCP Service Account with "BigQuery Data Editor" and "BigQuery Job User" roles.
